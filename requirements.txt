@@ -1,0 +1,8 @@
+anthropic
+playwright
+python-dotenv
+pandas
+requests
+jinja2
+mjml
+pydantic

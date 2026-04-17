@@ -1,0 +1,45 @@
+name: Scrape User Engagement
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # every 5 minutes (GitHub Actions minimum)
+  workflow_dispatch:          # allow manual runs
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium --with-deps
+
+      - name: Run scraper
+        env:
+          GRYPS_EMAIL: ${{ secrets.GRYPS_EMAIL }}
+          GRYPS_PASSWORD: ${{ secrets.GRYPS_PASSWORD }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+          GMAIL_SENDER: ${{ secrets.GMAIL_SENDER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+        run: python scraper.py
+
+      - name: Commit new data
+        run: |
+          git config user.name "gryps-bot"
+          git config user.email "bot@gryps.io"
+          git add data/
+          git diff --staged --quiet || git commit -m "data: $(date -u '+%Y-%m-%d %H:%M') UTC scrape"
+          git push
