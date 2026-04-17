@@ -1,10 +1,9 @@
 """
 Gryps User Engagement Scraper
-- Logs into insights.gryps.io via Playwright, grabs JWT
-- Fetches raw search data for Massport, NEU, Zubatkin
-- Deduplicates against existing CSV data
-- Analyzes new records with Claude API
-- Emails alerts for detected problems
+- Fetches raw search queries + dashboard usage for Massport, NEU, Zubatkin
+- Diffs dashboard snapshots to reconstruct a per-event activity feed
+- Stores all data as CSV on GitHub
+- Creates GitHub Issues for user problem alerts (no email dependency)
 """
 
 import asyncio
@@ -21,8 +20,6 @@ import requests
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 
-from emails import EmailClient
-
 load_dotenv()
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -36,61 +33,61 @@ TENANT_SLUG = {
     "zubatkin": "zubatkin",
 }
 DATA_DIR = Path(__file__).parent / "data"
-ALERT_EMAIL = os.getenv("ALERT_EMAIL", "jashtailor18@gmail.com")
-EMAIL_SENDER = "jash@gryps.io"
+GH_REPO = "jash-gryps/user-engagement-scraper"
+GH_TOKEN = os.getenv("GH_PAT", os.getenv("GITHUB_TOKEN", ""))
 
-CSV_FIELDS = ["id", "date_created", "tenant", "email", "search_type",
-              "question", "answer", "thumbs_up", "thumbs_down"]
+SEARCH_FIELDS = ["id", "date_created", "tenant", "email", "search_type",
+                 "question", "answer", "thumbs_up", "thumbs_down"]
+
+DASHBOARD_SNAPSHOT_FIELDS = ["scraped_at", "tenant", "user", "dashboard_name", "views", "last_viewed"]
+DASHBOARD_EVENT_FIELDS = ["event_time", "tenant", "user", "dashboard_name", "views_delta", "total_views"]
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
 async def get_jwt() -> str:
-    """Login via Playwright and capture the Cognito JWT."""
     token = None
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context()
-        page = await context.new_page()
+        page = await browser.new_page()
 
         async def capture(response):
             nonlocal token
-            if not token and API_BASE in response.url:
+            if not token and "execute-api" in response.url:
                 auth = response.request.headers.get("authorization", "")
                 if auth.startswith("Bearer "):
                     token = auth
 
         page.on("response", capture)
-
         await page.goto(BASE_URL)
         await page.wait_for_load_state("domcontentloaded")
         await page.fill('input[type="email"]', os.getenv("GRYPS_EMAIL"))
         await page.fill('input[type="password"]', os.getenv("GRYPS_PASSWORD"))
         await page.click('button:has-text("Sign In")')
-        await page.wait_for_load_state("domcontentloaded")
 
-        # Navigate to a page that triggers API calls
-        await page.goto(f"{BASE_URL}/#/searches")
-        await page.wait_for_load_state("domcontentloaded")
-        await asyncio.sleep(3)
+        for path in ["/#/user-engagement", "/#/searches", "/#/search-engagement"]:
+            if token:
+                break
+            await page.goto(f"{BASE_URL}{path}")
+            await page.wait_for_load_state("domcontentloaded")
+            await asyncio.sleep(4)
 
         await browser.close()
 
     if not token:
-        raise RuntimeError("Failed to capture JWT — login may have failed")
+        raise RuntimeError("Failed to capture JWT")
 
     print(f"[auth] JWT acquired")
     return token
 
 
-# ── Data Fetching ─────────────────────────────────────────────────────────────
+# ── API Helpers ───────────────────────────────────────────────────────────────
 
-def fetch_searches(token: str, tenant: str) -> list[dict]:
-    """Fetch raw search records for a tenant."""
+def api_get(token: str, path: str, params: dict = None) -> list:
     r = requests.get(
-        f"{API_BASE}/searches",
-        params={"user_type": "Customer", "tenant": tenant},
+        f"{API_BASE}{path}",
+        params={"user_type": "Customer", **(params or {})},
         headers={"Authorization": token},
         timeout=30,
     )
@@ -98,219 +95,309 @@ def fetch_searches(token: str, tenant: str) -> list[dict]:
     return r.json().get("data", [])
 
 
-def normalize(record: dict) -> dict:
-    """Flatten API record to CSV row."""
+# ── Storage Helpers ───────────────────────────────────────────────────────────
+
+def csv_path_searches(tenant: str) -> Path:
+    slug = TENANT_SLUG.get(tenant, tenant)
+    month = datetime.now(timezone.utc).strftime("%Y-%m")
+    return DATA_DIR / slug / "searches" / f"{month}.csv"
+
+
+def csv_path_dashboard_events(tenant: str) -> Path:
+    slug = TENANT_SLUG.get(tenant, tenant)
+    month = datetime.now(timezone.utc).strftime("%Y-%m")
+    return DATA_DIR / slug / "dashboard_events" / f"{month}.csv"
+
+
+def csv_path_dashboard_snapshot(tenant: str) -> Path:
+    slug = TENANT_SLUG.get(tenant, tenant)
+    return DATA_DIR / slug / "dashboard_snapshot.csv"
+
+
+def load_csv(path: Path, key_field: str = None) -> list | dict:
+    if not path.exists():
+        return {} if key_field else []
+    with open(path, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    if key_field:
+        return {r[key_field]: r for r in rows}
+    return rows
+
+
+def write_csv(path: Path, fields: list, rows: list, mode: str = "a") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    is_new = not path.exists() or mode == "w"
+    with open(path, mode, newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        if is_new or mode == "w":
+            w.writeheader()
+        w.writerows(rows)
+
+
+# ── Search Scraping ───────────────────────────────────────────────────────────
+
+def normalize_search(r: dict) -> dict:
     return {
-        "id": record.get("sk", ""),
-        "date_created": record.get("date_created", ""),
-        "tenant": record.get("tenant", ""),
-        "email": record.get("email", ""),
-        "search_type": record.get("search_type", ""),
-        "question": record.get("question", "") or "",
-        "answer": (record.get("answer", "") or "")[:2000],  # trim long answers
-        "thumbs_up": record.get("thumbs_up", "false"),
-        "thumbs_down": record.get("thumbs_down", "false"),
+        "id": r.get("sk", ""),
+        "date_created": r.get("date_created", ""),
+        "tenant": r.get("tenant", ""),
+        "email": r.get("email", ""),
+        "search_type": r.get("search_type", ""),
+        "question": (r.get("question", "") or "").replace("\n", " "),
+        "answer": (r.get("answer", "") or "")[:1500].replace("\n", " "),
+        "thumbs_up": r.get("thumbs_up", "false"),
+        "thumbs_down": r.get("thumbs_down", "false"),
     }
 
 
-# ── CSV Storage ───────────────────────────────────────────────────────────────
-
-def csv_path(tenant: str) -> Path:
-    slug = TENANT_SLUG.get(tenant, tenant)
-    month = datetime.now(timezone.utc).strftime("%Y-%m")
-    return DATA_DIR / slug / f"searches_{month}.csv"
-
-
-def load_seen_ids(tenant: str) -> set[str]:
-    path = csv_path(tenant)
-    if not path.exists():
-        return set()
-    with open(path, newline="", encoding="utf-8") as f:
-        return {row["id"] for row in csv.DictReader(f)}
+def scrape_searches(token: str, tenant: str) -> int:
+    records = api_get(token, "/searches", {"tenant": tenant})
+    path = csv_path_searches(tenant)
+    seen = {r["id"] for r in load_csv(path)} if path.exists() else set()
+    new_rows = [normalize_search(r) for r in records if r.get("sk") not in seen]
+    if new_rows:
+        write_csv(path, SEARCH_FIELDS, new_rows)
+        print(f"  [searches] +{len(new_rows)} new records → {path.relative_to(DATA_DIR.parent)}")
+    return new_rows, new_rows
 
 
-def append_records(tenant: str, records: list[dict]) -> None:
-    path = csv_path(tenant)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    is_new = not path.exists()
-    with open(path, "a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
-        if is_new:
-            w.writeheader()
-        w.writerows(records)
-    print(f"[storage] Wrote {len(records)} new records → {path}")
+# ── Dashboard Usage Scraping ──────────────────────────────────────────────────
+
+def scrape_dashboard_usage(token: str, tenant: str) -> list:
+    """
+    Fetches current dashboard usage snapshot, diffs against previous snapshot,
+    records new view events, and saves updated snapshot.
+    Returns list of new events (each event = a dashboard view detected).
+    """
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    records = api_get(token, "/dashboard-usage", {"tenant": tenant})
+
+    snapshot_path = csv_path_dashboard_snapshot(tenant)
+    prev = load_csv(snapshot_path, key_field=None)
+    prev_lookup = {(r["user"], r["dashboard_name"]): r for r in prev}
+
+    new_events = []
+    new_snapshot = []
+
+    for r in records:
+        key = (r["user"], r["dashboard_name"])
+        current_views = int(r.get("views", 0))
+        current_last_viewed = r.get("last_viewed", "")
+
+        snapshot_row = {
+            "scraped_at": now,
+            "tenant": r.get("tenant", tenant),
+            "user": r["user"],
+            "dashboard_name": r["dashboard_name"],
+            "views": str(current_views),
+            "last_viewed": current_last_viewed,
+        }
+        new_snapshot.append(snapshot_row)
+
+        prev_row = prev_lookup.get(key)
+        if prev_row:
+            prev_views = int(prev_row.get("views", 0))
+            delta = current_views - prev_views
+            if delta > 0 or current_last_viewed != prev_row.get("last_viewed", ""):
+                new_events.append({
+                    "event_time": current_last_viewed or now,
+                    "tenant": r.get("tenant", tenant),
+                    "user": r["user"],
+                    "dashboard_name": r["dashboard_name"],
+                    "views_delta": str(max(delta, 1)),
+                    "total_views": str(current_views),
+                })
+        else:
+            # First time seeing this user+dashboard — record as initial event
+            new_events.append({
+                "event_time": current_last_viewed or now,
+                "tenant": r.get("tenant", tenant),
+                "user": r["user"],
+                "dashboard_name": r["dashboard_name"],
+                "views_delta": str(current_views),
+                "total_views": str(current_views),
+            })
+
+    # Overwrite snapshot with latest
+    write_csv(snapshot_path, DASHBOARD_SNAPSHOT_FIELDS, new_snapshot, mode="w")
+
+    if new_events:
+        event_path = csv_path_dashboard_events(tenant)
+        write_csv(event_path, DASHBOARD_EVENT_FIELDS, new_events)
+        print(f"  [dashboard] +{len(new_events)} view events → {event_path.relative_to(DATA_DIR.parent)}")
+    else:
+        print(f"  [dashboard] no new views since last run")
+
+    return new_events
 
 
 # ── Claude Analysis ───────────────────────────────────────────────────────────
 
 ANALYSIS_PROMPT = """You are analyzing user search activity on an internal knowledge-base platform used by facilities managers at {tenant}.
 
-Below are recent search queries and their AI-generated answers. Your job is to identify users who may be struggling.
+Recent search queries and their AI-generated answers are below. Identify users who may be struggling.
 
-Flag a user/session as a PROBLEM if you see:
-- thumbs_down = true (explicit negative feedback)
-- The question is vague or confusing (e.g. "not working", "can't find", single-word repeated attempts)
-- The answer contains "not found", "no documents", "does not contain" — the platform couldn't help
-- Multiple similar questions from the same user in quick succession (indicates they didn't find what they needed)
+Flag a user as a PROBLEM if:
+- thumbs_down is true (explicit negative feedback)
+- Multiple similar/refined queries in quick succession (user not finding answer)
+- Answer contains "not found", "no documents", "does not contain" (platform couldn't help)
+- Query is vague, repeated, or shows frustration
 
-Return a JSON object with this exact structure:
+Return ONLY valid JSON (no markdown):
 {{
   "has_problems": true/false,
-  "summary": "One sentence summary of overall search health",
+  "summary": "One sentence on overall search health",
   "problems": [
     {{
       "email": "user@example.com",
-      "queries": ["their question 1", "their question 2"],
-      "issue": "Why this looks like a problem",
+      "queries": ["question 1", "question 2"],
+      "issue": "Why this is a problem",
       "severity": "high/medium/low"
     }}
   ]
 }}
 
-Return only valid JSON, no markdown.
-
 SEARCH DATA:
-{data}
-"""
+{data}"""
 
 
-def analyze_with_claude(tenant: str, records: list[dict]) -> dict:
+def analyze_searches(tenant: str, records: list) -> dict:
     if not records:
         return {"has_problems": False, "summary": "No new searches", "problems": []}
 
     client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-
-    # Summarize records for the prompt (keep it concise)
-    rows = []
-    for r in records[-100:]:  # last 100 new records
-        rows.append({
+    rows = [
+        {
             "email": r["email"],
             "time": r["date_created"],
             "question": r["question"],
             "answer_snippet": r["answer"][:300],
             "thumbs_down": r["thumbs_down"],
-        })
+        }
+        for r in records[-100:]
+    ]
 
-    message = client.messages.create(
+    msg = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=1024,
-        messages=[{
-            "role": "user",
-            "content": ANALYSIS_PROMPT.format(
-                tenant=tenant,
-                data=json.dumps(rows, indent=2)
-            )
-        }]
+        max_tokens=2048,
+        messages=[{"role": "user", "content": ANALYSIS_PROMPT.format(
+            tenant=tenant, data=json.dumps(rows, indent=2)
+        )}],
     )
 
-    raw = message.content[0].text.strip()
+    raw = msg.content[0].text.strip()
+    # Strip markdown code fences if present
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        # Try extracting JSON block
         match = re.search(r'\{.*\}', raw, re.DOTALL)
         if match:
-            return json.loads(match.group())
+            try:
+                return json.loads(match.group())
+            except Exception:
+                pass
+        print(f"  [claude] Warning: could not parse response for {tenant}")
         return {"has_problems": False, "summary": "Parse error", "problems": []}
 
 
-# ── Email Alerting ────────────────────────────────────────────────────────────
+# ── GitHub Issues Alerting ────────────────────────────────────────────────────
 
-def send_alert(tenant: str, analysis: dict, new_count: int) -> None:
+def create_github_issue(tenant: str, analysis: dict, new_search_count: int) -> None:
     if not analysis.get("has_problems") or not analysis.get("problems"):
         return
+    if not GH_TOKEN:
+        print("  [alert] No GH_PAT set — skipping issue creation")
+        return
 
-    client = EmailClient(sender=EMAIL_SENDER)
+    problems = analysis["problems"]
+    severity_emoji = {"high": "🔴", "medium": "🟡", "low": "🟢"}
 
-    problems_html = ""
-    for p in analysis["problems"]:
-        severity_color = {"high": "#d32f2f", "medium": "#f57c00", "low": "#388e3c"}.get(
-            p.get("severity", "medium"), "#f57c00"
+    body_lines = [
+        f"**{new_search_count}** new searches analyzed — **{len(problems)}** users may be struggling.\n",
+        f"> {analysis.get('summary', '')}\n",
+        "---\n",
+    ]
+    for p in problems:
+        emoji = severity_emoji.get(p.get("severity", "medium"), "🟡")
+        queries = "\n".join(f"  - `{q}`" for q in p.get("queries", []))
+        body_lines.append(
+            f"### {emoji} {p['email']}\n"
+            f"**Issue:** {p.get('issue', '')}\n"
+            f"**Queries:**\n{queries}\n"
         )
-        queries = "<br>".join(f"• {q}" for q in p.get("queries", []))
-        problems_html += f"""
-        <tr>
-            <td style="padding:8px;border-bottom:1px solid #eee;">
-                <strong>{p.get('email')}</strong><br>
-                <span style="color:{severity_color};font-weight:bold;">[{p.get('severity','?').upper()}]</span>
-                {p.get('issue','')}<br>
-                <small style="color:#666;">{queries}</small>
-            </td>
-        </tr>"""
 
-    html_body = f"""
-    <html><body style="font-family:sans-serif;max-width:600px;margin:auto;">
-        <h2 style="color:#1a237e;">User Engagement Alert — {tenant.replace('-', ' ').title()}</h2>
-        <p><strong>{new_count}</strong> new searches analyzed. <strong>{len(analysis['problems'])}</strong> users may be struggling.</p>
-        <p style="color:#555;">{analysis.get('summary', '')}</p>
-        <table width="100%" style="border-collapse:collapse;margin-top:16px;">
-            <thead><tr style="background:#e8eaf6;">
-                <th style="padding:8px;text-align:left;">User / Issue</th>
-            </tr></thead>
-            <tbody>{problems_html}</tbody>
-        </table>
-        <p style="margin-top:24px;color:#999;font-size:12px;">
-            View full data: <a href="{BASE_URL}/#/searches">insights.gryps.io</a>
-        </p>
-    </body></html>"""
+    body_lines.append(f"\n---\n[View on Gryps]({BASE_URL}/#/searches)")
 
-    import smtplib
-    from email.mime.multipart import MIMEMultipart
-    from email.mime.text import MIMEText
-    from configparser import ConfigParser
+    r = requests.post(
+        f"https://api.github.com/repos/{GH_REPO}/issues",
+        headers={
+            "Authorization": f"token {GH_TOKEN}",
+            "Accept": "application/vnd.github.v3+json",
+        },
+        json={
+            "title": f"[{tenant.replace('-',' ').title()}] {len(problems)} user(s) struggling with Search",
+            "body": "\n".join(body_lines),
+            "labels": ["alert", tenant],
+        },
+    )
+    if r.status_code == 201:
+        print(f"  [alert] GitHub issue created: {r.json()['html_url']}")
+    else:
+        print(f"  [alert] Failed to create issue: {r.status_code} {r.text[:100]}")
 
-    config = ConfigParser()
-    config.read(Path(__file__).parent / "config.ini")
-    creds = config[EMAIL_SENDER]
 
-    msg = MIMEMultipart("alternative")
-    msg["From"] = EMAIL_SENDER
-    msg["To"] = ALERT_EMAIL
-    msg["Subject"] = f"[Gryps Alert] {len(analysis['problems'])} users struggling on {tenant.replace('-',' ').title()}"
-    msg.attach(MIMEText(html_body, "html"))
+def ensure_gh_labels() -> None:
+    if not GH_TOKEN:
+        return
+    headers = {
+        "Authorization": f"token {GH_TOKEN}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+    existing = {l["name"] for l in requests.get(
+        f"https://api.github.com/repos/{GH_REPO}/labels", headers=headers
+    ).json() if isinstance(l, dict)}
 
-    with smtplib.SMTP("smtp.gmail.com", 587) as server:
-        server.starttls()
-        server.login(creds["sender"], creds["password"])
-        server.sendmail(EMAIL_SENDER, ALERT_EMAIL, msg.as_string())
-
-    print(f"[email] Alert sent for {tenant} — {len(analysis['problems'])} problems")
+    for label, color in [("alert", "d93f0b"), ("massport", "0075ca"),
+                          ("northeastern-university", "e4e669"), ("zubatkin", "cfd3d7")]:
+        if label not in existing:
+            requests.post(
+                f"https://api.github.com/repos/{GH_REPO}/labels",
+                headers=headers,
+                json={"name": label, "color": color},
+            )
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 async def main():
-    print(f"\n{'='*50}")
+    print(f"\n{'='*55}")
     print(f"Gryps Scraper — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
-    print(f"{'='*50}")
+    print(f"{'='*55}")
 
     token = await get_jwt()
+    ensure_gh_labels()
 
     for tenant in TENANTS:
-        print(f"\n[{tenant}] Fetching searches...")
+        print(f"\n[{tenant}]")
         try:
-            records = fetch_searches(token, tenant)
-            print(f"[{tenant}] Got {len(records)} records from API")
+            # Searches
+            new_searches, _ = scrape_searches(token, tenant)
 
-            seen = load_seen_ids(tenant)
-            new_records = [
-                normalize(r) for r in records
-                if r.get("sk") and r["sk"] not in seen
-            ]
-            print(f"[{tenant}] {len(new_records)} new records")
+            # Dashboard usage
+            scrape_dashboard_usage(token, tenant)
 
-            if new_records:
-                append_records(tenant, new_records)
-                analysis = analyze_with_claude(tenant, new_records)
-                print(f"[{tenant}] Analysis: {analysis.get('summary')}")
+            # Analyze and alert on searches
+            if new_searches:
+                analysis = analyze_searches(tenant, new_searches)
+                print(f"  [claude] {analysis.get('summary', '')}")
                 if analysis.get("has_problems"):
-                    print(f"[{tenant}] ⚠ {len(analysis['problems'])} problems detected")
-                    send_alert(tenant, analysis, len(new_records))
-            else:
-                print(f"[{tenant}] No new data since last run")
+                    create_github_issue(tenant, analysis, len(new_searches))
 
         except Exception as e:
-            print(f"[{tenant}] ERROR: {e}", file=sys.stderr)
+            print(f"  ERROR: {e}", file=sys.stderr)
+            import traceback; traceback.print_exc()
 
     print("\nDone.")
 
