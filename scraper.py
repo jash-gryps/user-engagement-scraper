@@ -99,14 +99,12 @@ def api_get(token: str, path: str, params: dict = None) -> list:
 
 def csv_path_searches(tenant: str) -> Path:
     slug = TENANT_SLUG.get(tenant, tenant)
-    month = datetime.now(timezone.utc).strftime("%Y-%m")
-    return DATA_DIR / slug / "searches" / f"{month}.csv"
+    return DATA_DIR / slug / "searches.csv"
 
 
 def csv_path_dashboard_events(tenant: str) -> Path:
     slug = TENANT_SLUG.get(tenant, tenant)
-    month = datetime.now(timezone.utc).strftime("%Y-%m")
-    return DATA_DIR / slug / "dashboard_events" / f"{month}.csv"
+    return DATA_DIR / slug / "dashboard_events.csv"
 
 
 def csv_path_dashboard_snapshot(tenant: str) -> Path:
