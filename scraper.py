@@ -26,11 +26,12 @@ load_dotenv()
 
 BASE_URL = "https://insights.gryps.io"
 API_BASE = "https://kcdr22q3bd.execute-api.us-east-1.amazonaws.com/prod//ues"
-TENANTS = ["massport", "northeastern-university", "zubatkin"]
+TENANTS = ["massport", "northeastern-university", "zubatkin", "javits"]
 TENANT_SLUG = {
     "massport": "massport",
     "northeastern-university": "neu",
     "zubatkin": "zubatkin",
+    "javits": "javits",
 }
 DATA_DIR = Path(__file__).parent / "data"
 GH_REPO = "jash-gryps/user-engagement-scraper"
