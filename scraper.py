@@ -10,12 +10,10 @@ import asyncio
 import csv
 import json
 import os
-import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-import anthropic
 import requests
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
@@ -230,77 +228,6 @@ def scrape_dashboard_usage(token: str, tenant: str) -> list:
     return new_events
 
 
-# ── Claude Analysis ───────────────────────────────────────────────────────────
-
-ANALYSIS_PROMPT = """You are analyzing user search activity on an internal knowledge-base platform used by facilities managers at {tenant}.
-
-Recent search queries and their AI-generated answers are below. Identify users who may be struggling.
-
-Flag a user as a PROBLEM if:
-- thumbs_down is true (explicit negative feedback)
-- Multiple similar/refined queries in quick succession (user not finding answer)
-- Answer contains "not found", "no documents", "does not contain" (platform couldn't help)
-- Query is vague, repeated, or shows frustration
-
-Return ONLY valid JSON (no markdown):
-{{
-  "has_problems": true/false,
-  "summary": "One sentence on overall search health",
-  "problems": [
-    {{
-      "email": "user@example.com",
-      "queries": ["question 1", "question 2"],
-      "issue": "Why this is a problem",
-      "severity": "high/medium/low"
-    }}
-  ]
-}}
-
-SEARCH DATA:
-{data}"""
-
-
-def analyze_searches(tenant: str, records: list) -> dict:
-    if not records:
-        return {"has_problems": False, "summary": "No new searches", "problems": []}
-
-    client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-    rows = [
-        {
-            "email": r["email"],
-            "time": r["date_created"],
-            "question": r["question"],
-            "answer_snippet": r["answer"][:300],
-            "thumbs_down": r["thumbs_down"],
-        }
-        for r in records[-100:]
-    ]
-
-    msg = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=2048,
-        messages=[{"role": "user", "content": ANALYSIS_PROMPT.format(
-            tenant=tenant, data=json.dumps(rows, indent=2)
-        )}],
-    )
-
-    raw = msg.content[0].text.strip()
-    # Strip markdown code fences if present
-    raw = re.sub(r"^```(?:json)?\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        match = re.search(r'\{.*\}', raw, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group())
-            except Exception:
-                pass
-        print(f"  [claude] Warning: could not parse response for {tenant}")
-        return {"has_problems": False, "summary": "Parse error", "problems": []}
-
-
 # ── GitHub Issues Alerting ────────────────────────────────────────────────────
 
 def create_github_issue(tenant: str, analysis: dict, new_search_count: int) -> None:
@@ -387,12 +314,6 @@ async def main():
             # Dashboard usage
             scrape_dashboard_usage(token, tenant)
 
-            # Analyze and alert on searches
-            if new_searches:
-                analysis = analyze_searches(tenant, new_searches)
-                print(f"  [claude] {analysis.get('summary', '')}")
-                if analysis.get("has_problems"):
-                    create_github_issue(tenant, analysis, len(new_searches))
 
         except Exception as e:
             print(f"  ERROR: {e}", file=sys.stderr)

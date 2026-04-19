@@ -1,4 +1,3 @@
-anthropic
 playwright
 python-dotenv
 pandas
