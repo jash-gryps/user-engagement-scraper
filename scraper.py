@@ -38,13 +38,36 @@ GH_TOKEN = os.getenv("GH_PAT", os.getenv("GITHUB_TOKEN", ""))
 SEARCH_FIELDS = ["id", "date_created", "tenant", "email", "search_type",
                  "question", "answer", "thumbs_up", "thumbs_down"]
 
-DASHBOARD_SNAPSHOT_FIELDS = ["scraped_at", "tenant", "user", "dashboard_name", "views", "last_viewed"]
+DASHBOARD_SNAPSHOT_FIELDS = ["tenant", "user", "dashboard_name", "views", "last_viewed"]
+TOKEN_CACHE = Path(__file__).parent / ".jwt_cache"
+JWT_TTL_SECONDS = 3000  # Cognito tokens last 1hr; refresh at 50min to be safe
 DASHBOARD_EVENT_FIELDS = ["event_time", "tenant", "user", "dashboard_name", "views_delta", "total_views"]
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
-async def get_jwt() -> str:
+def load_cached_jwt() -> str | None:
+    if not TOKEN_CACHE.exists():
+        return None
+    try:
+        data = json.loads(TOKEN_CACHE.read_text())
+        age = datetime.now(timezone.utc).timestamp() - data["cached_at"]
+        if age < JWT_TTL_SECONDS:
+            print(f"[auth] Using cached JWT ({int(age)}s old)")
+            return data["token"]
+    except Exception:
+        pass
+    return None
+
+
+def save_jwt(token: str) -> None:
+    TOKEN_CACHE.write_text(json.dumps({
+        "token": token,
+        "cached_at": datetime.now(timezone.utc).timestamp()
+    }))
+
+
+async def fetch_jwt_via_browser() -> str:
     token = None
 
     async with async_playwright() as p:
@@ -77,7 +100,17 @@ async def get_jwt() -> str:
     if not token:
         raise RuntimeError("Failed to capture JWT")
 
-    print(f"[auth] JWT acquired")
+    return token
+
+
+async def get_jwt() -> str:
+    token = load_cached_jwt()
+    if token:
+        return token
+    print("[auth] Logging in via browser...")
+    token = await fetch_jwt_via_browser()
+    save_jwt(token)
+    print("[auth] JWT acquired and cached")
     return token
 
 
@@ -166,7 +199,6 @@ def scrape_dashboard_usage(token: str, tenant: str) -> list:
     records new view events, and saves updated snapshot.
     Returns list of new events (each event = a dashboard view detected).
     """
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     records = api_get(token, "/dashboard-usage", {"tenant": tenant})
 
     snapshot_path = csv_path_dashboard_snapshot(tenant)
@@ -182,7 +214,6 @@ def scrape_dashboard_usage(token: str, tenant: str) -> list:
         current_last_viewed = r.get("last_viewed", "")
 
         snapshot_row = {
-            "scraped_at": now,
             "tenant": r.get("tenant", tenant),
             "user": r["user"],
             "dashboard_name": r["dashboard_name"],

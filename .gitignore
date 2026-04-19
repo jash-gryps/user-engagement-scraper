@@ -4,6 +4,7 @@ __pycache__/
 *.json
 logs/
 venv/
+.jwt_cache
 *.png
 *.jpg
 .DS_Store
