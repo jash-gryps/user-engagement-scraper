@@ -199,6 +199,7 @@ def scrape_dashboard_usage(token: str, tenant: str) -> list:
     records new view events, and saves updated snapshot.
     Returns list of new events (each event = a dashboard view detected).
     """
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     records = api_get(token, "/dashboard-usage", {"tenant": tenant})
 
     snapshot_path = csv_path_dashboard_snapshot(tenant)
