@@ -10,3 +10,5 @@ venv/
 .DS_Store
 discover_*.py
 searches_2026-*.csv
+data/
+run.sh

@@ -1,20 +1,20 @@
 name: Scrape User Engagement
 
 on:
-  schedule:
-    - cron: '*/5 * * * *'   # every 5 minutes (GitHub Actions minimum)
-  workflow_dispatch:          # allow manual runs
+  workflow_dispatch:
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GH_PAT }}
+
+      - name: Checkout data repo
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          git clone https://jash-gryps:${GH_PAT}@github.com/jash-gryps/user-engagement-data.git data
 
       - uses: actions/setup-python@v5
         with:
@@ -32,14 +32,16 @@ jobs:
           GRYPS_PASSWORD: ${{ secrets.GRYPS_PASSWORD }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
-          GMAIL_SENDER: ${{ secrets.GMAIL_SENDER }}
-          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+
         run: python scraper.py
 
-      - name: Commit new data
+      - name: Push data to private repo
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
         run: |
+          cd data
           git config user.name "gryps-bot"
           git config user.email "bot@gryps.io"
-          git add data/
-          git diff --staged --quiet || git commit -m "data: $(date -u '+%Y-%m-%d %H:%M') UTC scrape"
-          git push
+          git add .
+          git diff --staged --quiet || (git commit -m "data: $(date -u '+%Y-%m-%d %H:%M') UTC" && git push)
