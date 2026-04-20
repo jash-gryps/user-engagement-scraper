@@ -30,7 +30,8 @@ jobs:
         env:
           GRYPS_EMAIL: ${{ secrets.GRYPS_EMAIL }}
           GRYPS_PASSWORD: ${{ secrets.GRYPS_PASSWORD }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GRYPS_BASE_URL: ${{ secrets.GRYPS_BASE_URL }}
+          GRYPS_API_BASE: ${{ secrets.GRYPS_API_BASE }}
           ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
           GH_PAT: ${{ secrets.GH_PAT }}
 

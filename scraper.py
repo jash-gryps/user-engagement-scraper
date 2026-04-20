@@ -22,8 +22,8 @@ load_dotenv()
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-BASE_URL = "https://insights.gryps.io"
-API_BASE = "https://kcdr22q3bd.execute-api.us-east-1.amazonaws.com/prod//ues"
+BASE_URL = os.getenv("GRYPS_BASE_URL", "https://insights.gryps.io")
+API_BASE = os.getenv("GRYPS_API_BASE", "https://kcdr22q3bd.execute-api.us-east-1.amazonaws.com/prod//ues")
 TENANTS = ["massport", "northeastern-university", "zubatkin", "javits"]
 TENANT_SLUG = {
     "massport": "massport",
