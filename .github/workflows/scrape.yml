@@ -45,4 +45,8 @@ jobs:
           git config user.name "gryps-bot"
           git config user.email "bot@gryps.io"
           git add .
-          git diff --staged --quiet || (git commit -m "data: $(date -u '+%Y-%m-%d %H:%M') UTC" && git push)
+          if ! git diff --staged --quiet; then
+            git commit -m "data: $(date -u '+%Y-%m-%d %H:%M') UTC"
+            git pull --rebase origin main
+            git push
+          fi
