@@ -47,6 +47,11 @@ jobs:
           git add .
           if ! git diff --staged --quiet; then
             git commit -m "data: $(date -u '+%Y-%m-%d %H:%M') UTC"
-            git pull --rebase origin main
-            git push
+            # Retry push up to 3 times, pulling with merge strategy on conflict
+            for i in 1 2 3; do
+              git push && break || {
+                echo "Push attempt $i failed, pulling and retrying..."
+                git pull --no-rebase -X ours origin main
+              }
+            done
           fi
